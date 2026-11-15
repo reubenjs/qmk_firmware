@@ -361,6 +361,9 @@ static void shared_matrix_rgb_disable_output(void) {
 }
 
 static void update_pwm_channels(PWMDriver *pwmp) {
+#    if (SN32F2XX_PWM_CONTROL == HARDWARE_PWM)
+    static bool hw_pwm_output_pending = false;
+#    endif
     // Advance to the next LED RGB channels
     current_row++;
     /* Check if counter has wrapped around, reset before the next pass */
@@ -384,15 +387,22 @@ static void update_pwm_channels(PWMDriver *pwmp) {
 #    endif // SHARED_MATRIX
     }
     bool enable_pwm_output = false;
+#    if (SN32F2XX_PWM_CONTROL == HARDWARE_PWM)
+    /* In hardware PWM the duty programmed now is displayed during the next
+     * PWM period, while the IO and row-pin enables apply immediately. The
+     * row-output gate must therefore track the duty of the period being
+     * displayed, not the one being written. */
+    bool next_output = false;
+#    endif
     for (uint8_t current_key_col = 0; current_key_col < SN32F2XX_RGB_MATRIX_COLS; current_key_col++) {
         uint8_t led_index = g_led_config.matrix_co[current_key_row][current_key_col];
 #    if (SN32F2XX_PWM_CONTROL == SOFTWARE_PWM)
         if (led_index >= SN32F2XX_LED_COUNT) continue;
-#    endif // SN32F2XX_PWM_CONTROL
         // Check if we need to enable RGB output
         if (led_state[led_index].b > 0) enable_pwm_output |= true;
         if (led_state[led_index].g > 0) enable_pwm_output |= true;
         if (led_state[led_index].r > 0) enable_pwm_output |= true;
+#    endif // SN32F2XX_PWM_CONTROL
         // Update matching RGB channel PWM configuration
 #    if (SN32F2XX_PWM_CONTROL == HARDWARE_PWM)
         /* The duty programmed here only takes effect on the next PWM
@@ -415,6 +425,7 @@ static void update_pwm_channels(PWMDriver *pwmp) {
             }
         }
         pwmEnableChannel(pwmp, chan_col_order[current_key_col], duty);
+        if (duty > 0) next_output = true;
 #    elif (SN32F2XX_PWM_CONTROL == SOFTWARE_PWM)
         switch (current_row % SN32F2XX_RGB_MATRIX_ROW_CHANNELS) {
             case 0:
@@ -430,6 +441,10 @@ static void update_pwm_channels(PWMDriver *pwmp) {
         }
 #    endif
     }
+#    if (SN32F2XX_PWM_CONTROL == HARDWARE_PWM)
+    enable_pwm_output     = hw_pwm_output_pending;
+    hw_pwm_output_pending = next_output;
+#    endif
     // Enable RGB output
     if (enable_pwm_output) {
 #    if (SN32F2XX_RGB_OUTPUT_ACTIVE_LEVEL == SN32F2XX_RGB_OUTPUT_ACTIVE_HIGH)
