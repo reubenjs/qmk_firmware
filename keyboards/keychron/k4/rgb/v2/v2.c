@@ -37,9 +37,16 @@ static uint16_t bt_batt_timer    = 0;
 static bool     bt_batt_due      = false;
 static uint16_t bt_batt_show_timer = 0;
 static bool     bt_batt_show       = false;
+static bool     mac_mode           = false;
+static uint16_t mac_fkeys          = 0;
+static bool     mac_fn_rcmd        = false;
 
+static const uint16_t PROGMEM mac_fn_defaults[] = {
+    KC_SLCT, KC_PAUS, KC_APP,   KC_F5,   RM_VALD, RM_VALU,
+    KC_MPRV, KC_MPLY, KC_MNXT,  KC_MUTE, KC_VOLD, KC_VOLU,
+};
 
-// DIP index 0 = cable/BT selector (active = cable), index 1 = win/mac (unused).
+// DIP index 0 = cable/BT selector (active = cable), index 1 = win/mac (active = mac).
 static void k4v2_apply_dip_mode(bool cable_active) {
     bt_mode = !cable_active;
     if (bt_mode) {
@@ -53,6 +60,17 @@ static void k4v2_apply_dip_mode(bool cable_active) {
     }
 }
 
+static void k4v2_apply_os_mode(bool mac_active) {
+    mac_mode = mac_active;
+    if (mac_fkeys || mac_fn_rcmd) {
+        clear_keyboard();
+        mac_fkeys   = 0;
+        mac_fn_rcmd = false;
+    }
+    layer_clear();
+    default_layer_set((layer_state_t)1 << (mac_mode ? K4V2_LAYER_MAC_BASE : K4V2_LAYER_WIN_BASE));
+}
+
 bool dip_switch_update_kb(uint8_t index, bool active) {
     if (!dip_switch_update_user(index, active)) {
         return false;
@@ -60,6 +78,8 @@ bool dip_switch_update_kb(uint8_t index, bool active) {
 
     if (index == 0 && bt_ready) {
         k4v2_apply_dip_mode(active);
+    } else if (index == 1) {
+        k4v2_apply_os_mode(active);
     }
 
     return true;
@@ -78,6 +98,47 @@ void keyboard_post_init_kb(void) {
 bool process_record_kb(uint16_t keycode, keyrecord_t *record) {
     if (!process_record_user(keycode, record)) {
         return false;
+    }
+
+    if (mac_mode) {
+        if (keycode == MO(K4V2_LAYER_FN)) {
+            if (record->event.pressed) {
+                default_layer_set(0);
+                layer_on(K4V2_LAYER_FN);
+            } else {
+                layer_off(K4V2_LAYER_FN);
+                default_layer_set((layer_state_t)1 << K4V2_LAYER_MAC_BASE);
+            }
+            return false;
+        }
+
+        if (record->event.key.row == 0 && record->event.key.col >= 1 && record->event.key.col <= 12) {
+            uint8_t  index    = record->event.key.col - 1;
+            uint16_t expected = pgm_read_word(&mac_fn_defaults[index]);
+            if (record->event.pressed && layer_state_is(K4V2_LAYER_FN) && keycode == expected) {
+                mac_fkeys |= (uint16_t)1 << index;
+                register_code(KC_F1 + index);
+                return false;
+            }
+            if (!record->event.pressed && (mac_fkeys & ((uint16_t)1 << index))) {
+                mac_fkeys &= ~((uint16_t)1 << index);
+                unregister_code(KC_F1 + index);
+                return false;
+            }
+        }
+
+        if (record->event.key.row == 5 && record->event.key.col == 10 && keycode == KC_RALT) {
+            if (record->event.pressed && layer_state_is(K4V2_LAYER_FN)) {
+                mac_fn_rcmd = true;
+                register_code(KC_RGUI);
+                return false;
+            }
+            if (!record->event.pressed && mac_fn_rcmd) {
+                mac_fn_rcmd = false;
+                unregister_code(KC_RGUI);
+                return false;
+            }
+        }
     }
 
     if (keycode == KC_BT_BAT) {
