@@ -395,18 +395,26 @@ static void update_pwm_channels(PWMDriver *pwmp) {
         if (led_state[led_index].r > 0) enable_pwm_output |= true;
         // Update matching RGB channel PWM configuration
 #    if (SN32F2XX_PWM_CONTROL == HARDWARE_PWM)
-        switch (current_row % SN32F2XX_RGB_MATRIX_ROW_CHANNELS) {
-            case 0:
-                pwmEnableChannel(pwmp, chan_col_order[current_key_col], led_state[led_index].b);
-                break;
-            case 1:
-                pwmEnableChannel(pwmp, chan_col_order[current_key_col], led_state[led_index].g);
-                break;
-            case 2:
-                pwmEnableChannel(pwmp, chan_col_order[current_key_col], led_state[led_index].r);
-                break;
-            default:;
+        /* The duty programmed here only takes effect on the next PWM
+         * period, while the channel IO enable applies immediately. Write
+         * zero duty for NO_LED positions instead of skipping the column,
+         * so the channel stays enabled for the in-flight period. */
+        uint8_t duty = 0;
+        if (led_index < SN32F2XX_LED_COUNT) {
+            switch (current_row % SN32F2XX_RGB_MATRIX_ROW_CHANNELS) {
+                case 0:
+                    duty = led_state[led_index].b;
+                    break;
+                case 1:
+                    duty = led_state[led_index].g;
+                    break;
+                case 2:
+                    duty = led_state[led_index].r;
+                    break;
+                default:;
+            }
         }
+        pwmEnableChannel(pwmp, chan_col_order[current_key_col], duty);
 #    elif (SN32F2XX_PWM_CONTROL == SOFTWARE_PWM)
         switch (current_row % SN32F2XX_RGB_MATRIX_ROW_CHANNELS) {
             case 0:
