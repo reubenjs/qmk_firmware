@@ -23,6 +23,10 @@
 #    define ITON_BT_BUFFER_LEN 16
 #endif
 
+#ifndef ITON_BT_RX_BUFFER_LEN
+#    define ITON_BT_RX_BUFFER_LEN 32
+#endif
+
 /**
  * Driver Macros
  */
@@ -56,6 +60,8 @@ uint8_t iton_bt_led_state = 0x00;
 #endif
 
 static uint8_t iton_bt_buffer[ITON_BT_BUFFER_LEN];
+static uint8_t iton_bt_rx_buffer[ITON_BT_RX_BUFFER_LEN];
+static bool    iton_bt_tx_active = false;
 uint8_t        iton_bt_send_kb_last_key = 0x00;
 
 const SPIConfig iton_bt_spicfg = {
@@ -104,7 +110,7 @@ static inline void iton_bt_rx_battery_notif(uint8_t data) {
 }
 
 static inline void iton_bt_rx_bluetooth_notif(uint8_t data) {
-    switch (iton_bt_buffer[2]) {
+    switch (data) {
         case bt_connection_success:
             iton_bt_is_connected = true;
 
@@ -135,32 +141,51 @@ static inline void iton_bt_rx_bluetooth_notif(uint8_t data) {
 static void iton_bt_rx_cb(void *arg) {
     if (gpio_read_pin(ITON_BT_INT_LINE)) {
         chSysLockFromISR();
-        spiStartReceiveI(&ITON_BT_SPI_PORT, ITON_BT_BUFFER_LEN, &iton_bt_buffer[0]);
+        if (iton_bt_tx_active) {
+            // Module started clocking a reply while our TX was still
+            // armed; the interrupted frame is dropped.
+            iton_bt_tx_active = false;
+            gpio_write_pin_low(ITON_BT_IRQ_LINE);
+        }
+        // The frame always starts at rx_buffer[0].
+        spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+        spiStartReceiveI(&ITON_BT_SPI_PORT, ITON_BT_RX_BUFFER_LEN, &iton_bt_rx_buffer[0]);
         chSysUnlockFromISR();
     } else {
         chSysLockFromISR();
-        spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+        size_t remaining = 0;
+        spiStopTransferI(&ITON_BT_SPI_PORT, &remaining);
         chSysUnlockFromISR();
+
+        size_t len = ITON_BT_RX_BUFFER_LEN - remaining;
+        if (len > ITON_BT_RX_BUFFER_LEN) {
+            len = ITON_BT_RX_BUFFER_LEN;
+        }
+        uint8_t *frame = &iton_bt_rx_buffer[0];
 
 #    ifdef ITON_BT_ENABLE_ACK
         // hack to make sure irq is low since acks messes with stuff
         gpio_write_pin_low(ITON_BT_IRQ_LINE);
 #    endif
 
-        switch (iton_bt_buffer[0]) {
+        switch (len ? frame[0] : 0) {
             case led_state:
 #    ifdef ITON_BT_ENABLE_LED_STATE
-                iton_bt_led_state = iton_bt_buffer[1];
+                if (len >= 2) {
+                    iton_bt_led_state = frame[1];
+                }
 #    endif
                 break;
             case notification:
-                switch (iton_bt_buffer[1]) {
-                    case notif_battery:
-                        iton_bt_rx_battery_notif(iton_bt_buffer[2]);
-                        break;
-                    case notif_bluetooth:
-                        iton_bt_rx_bluetooth_notif(iton_bt_buffer[2]);
-                        break;
+                if (len >= 3) {
+                    switch (frame[1]) {
+                        case notif_battery:
+                            iton_bt_rx_battery_notif(frame[2]);
+                            break;
+                        case notif_bluetooth:
+                            iton_bt_rx_bluetooth_notif(frame[2]);
+                            break;
+                    }
                 }
                 break;
         }
@@ -169,7 +194,10 @@ static void iton_bt_rx_cb(void *arg) {
 #endif
 
 void iton_bt_data_cb(SPIDriver *spip) {
-    gpio_write_pin_low(ITON_BT_IRQ_LINE);
+    if (iton_bt_tx_active) {
+        iton_bt_tx_active = false;
+        gpio_write_pin_low(ITON_BT_IRQ_LINE);
+    }
 }
 
 /**
@@ -194,6 +222,7 @@ void iton_bt_send(uint8_t cmd, uint8_t *data, uint8_t len) {
         ;
 
     gpio_write_pin_high(ITON_BT_IRQ_LINE);
+    iton_bt_tx_active = true;
     iton_bt_buffer[0] = cmd;
     memcpy(&iton_bt_buffer[1], data, len);
     spiStartSend(&ITON_BT_SPI_PORT, len + 1, &iton_bt_buffer[0]);
@@ -204,6 +233,7 @@ void iton_bt_send2(uint8_t cmd, uint8_t b1, uint8_t b2) {
         ;
 
     gpio_write_pin_high(ITON_BT_IRQ_LINE);
+    iton_bt_tx_active = true;
     iton_bt_buffer[0] = cmd;
     iton_bt_buffer[1] = b1;
     iton_bt_buffer[2] = b2;
@@ -213,6 +243,7 @@ void iton_bt_send2(uint8_t cmd, uint8_t b1, uint8_t b2) {
 
 inline void iton_bt_send_ack(uint8_t b1, uint8_t b2) {
     gpio_write_pin_high(ITON_BT_IRQ_LINE);
+    iton_bt_tx_active = true;
     iton_bt_buffer[0] = control;
     iton_bt_buffer[1] = b1;
     iton_bt_buffer[2] = b2;
