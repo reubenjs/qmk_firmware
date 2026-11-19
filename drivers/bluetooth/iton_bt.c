@@ -34,7 +34,11 @@
 
 // Guard time between frames so the module sees IRQ actually drop.
 #ifndef ITON_BT_TX_QUIET_US
-#    define ITON_BT_TX_QUIET_US 200
+#    define ITON_BT_TX_QUIET_US 10000
+#endif
+
+#ifndef ITON_BT_FN_PRESSED_VALUE
+#    define ITON_BT_FN_PRESSED_VALUE 0xA3
 #endif
 
 /**
@@ -258,10 +262,6 @@ static void iton_bt_wait_bus_idle(void) {
     while (chVTTimeElapsedSinceX(iton_bt_last_bus_time) < TIME_US2I(ITON_BT_TX_QUIET_US)) {
         wait_us(10);
     }
-    systime_t start = chVTGetSystemTimeX();
-    while (chVTTimeElapsedSinceX(start) < TIME_US2I(ITON_BT_TX_QUIET_US)) {
-        wait_us(10);
-    }
 }
 
 void iton_bt_send(uint8_t cmd, uint8_t *data, uint8_t len) {
@@ -315,7 +315,7 @@ inline void iton_bt_send_ack(uint8_t b1, uint8_t b2) {
 }
 
 void iton_bt_send_fn(bool pressed) {
-    uint8_t data = pressed ? 0xA3 : 0x00;
+    uint8_t data = pressed ? ITON_BT_FN_PRESSED_VALUE : 0x00;
 
     iton_bt_send(report_fn, &data, 1);
 }
