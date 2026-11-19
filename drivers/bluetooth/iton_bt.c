@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <hal.h>
+#include "wait.h"
 #include "gpio.h"
 #include "config.h"
 #include "iton_bt.h"
@@ -25,6 +26,15 @@
 
 #ifndef ITON_BT_RX_BUFFER_LEN
 #    define ITON_BT_RX_BUFFER_LEN 32
+#endif
+
+#ifndef ITON_BT_IRQ_WAIT_TIMEOUT_MS
+#    define ITON_BT_IRQ_WAIT_TIMEOUT_MS 50
+#endif
+
+// Guard time between frames so the module sees IRQ actually drop.
+#ifndef ITON_BT_TX_QUIET_US
+#    define ITON_BT_TX_QUIET_US 200
 #endif
 
 /**
@@ -59,10 +69,11 @@ bool iton_bt_is_connected = false;
 uint8_t iton_bt_led_state = 0x00;
 #endif
 
-static uint8_t iton_bt_buffer[ITON_BT_BUFFER_LEN];
-static uint8_t iton_bt_rx_buffer[ITON_BT_RX_BUFFER_LEN];
-static bool    iton_bt_tx_active = false;
-uint8_t        iton_bt_send_kb_last_key = 0x00;
+static uint8_t            iton_bt_buffer[ITON_BT_BUFFER_LEN];
+static uint8_t            iton_bt_rx_buffer[ITON_BT_RX_BUFFER_LEN];
+static bool               iton_bt_tx_active        = false;
+static volatile systime_t iton_bt_last_bus_time    = 0;
+uint8_t                   iton_bt_send_kb_last_key = 0x00;
 
 const SPIConfig iton_bt_spicfg = {
     .slave   = true,
@@ -195,7 +206,8 @@ static void iton_bt_rx_cb(void *arg) {
 
 void iton_bt_data_cb(SPIDriver *spip) {
     if (iton_bt_tx_active) {
-        iton_bt_tx_active = false;
+        iton_bt_last_bus_time = chVTGetSystemTimeX();
+        iton_bt_tx_active     = false;
         gpio_write_pin_low(ITON_BT_IRQ_LINE);
     }
 }
@@ -217,38 +229,88 @@ void iton_bt_init(void) {
     spiStart(&ITON_BT_SPI_PORT, &iton_bt_spicfg);
 }
 
-void iton_bt_send(uint8_t cmd, uint8_t *data, uint8_t len) {
-    while (gpio_read_pin(ITON_BT_IRQ_LINE))
-        ;
+/**
+ * Wait until the module has finished clocking our previous transfer
+ * (IRQ returned low). Returns true when the line is clear.
+ */
+static bool iton_bt_wait_irq_clear(void) {
+    systime_t start = chVTGetSystemTimeX();
+    while (gpio_read_pin(ITON_BT_IRQ_LINE)) {
+        if (chVTTimeElapsedSinceX(start) > TIME_MS2I(ITON_BT_IRQ_WAIT_TIMEOUT_MS)) {
+            // Module never clocked our frame out; give up on it.
+            chSysLock();
+            spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+            iton_bt_tx_active = false;
+            gpio_write_pin_low(ITON_BT_IRQ_LINE);
+            chSysUnlock();
+            return false;
+        }
+        wait_us(10);
+    }
+    return true;
+}
 
-    gpio_write_pin_high(ITON_BT_IRQ_LINE);
-    iton_bt_tx_active = true;
+/**
+ * Give the module a quiet window between frames: it does not notice
+ * back-to-back sends, so wait after the last transfer completed.
+ */
+static void iton_bt_wait_bus_idle(void) {
+    while (chVTTimeElapsedSinceX(iton_bt_last_bus_time) < TIME_US2I(ITON_BT_TX_QUIET_US)) {
+        wait_us(10);
+    }
+    systime_t start = chVTGetSystemTimeX();
+    while (chVTTimeElapsedSinceX(start) < TIME_US2I(ITON_BT_TX_QUIET_US)) {
+        wait_us(10);
+    }
+}
+
+void iton_bt_send(uint8_t cmd, uint8_t *data, uint8_t len) {
+    if (!iton_bt_wait_irq_clear()) {
+        return;
+    }
+    iton_bt_wait_bus_idle();
+
     iton_bt_buffer[0] = cmd;
     memcpy(&iton_bt_buffer[1], data, len);
-    spiStartSend(&ITON_BT_SPI_PORT, len + 1, &iton_bt_buffer[0]);
+    memset(&iton_bt_buffer[len + 1], 0, ITON_BT_BUFFER_LEN - len - 1);
+
+    // Atomically: abort anything pending, arm the transfer, raise IRQ.
+    chSysLock();
+    spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+    iton_bt_tx_active = true;
+    spiStartExchangeI(&ITON_BT_SPI_PORT, len + 1, &iton_bt_buffer[0], &iton_bt_rx_buffer[0]);
+    gpio_write_pin_high(ITON_BT_IRQ_LINE);
+    chSysUnlock();
 }
 
 void iton_bt_send2(uint8_t cmd, uint8_t b1, uint8_t b2) {
-    while (gpio_read_pin(ITON_BT_IRQ_LINE))
-        ;
+    if (!iton_bt_wait_irq_clear()) {
+        return;
+    }
+    iton_bt_wait_bus_idle();
 
-    gpio_write_pin_high(ITON_BT_IRQ_LINE);
-    iton_bt_tx_active = true;
     iton_bt_buffer[0] = cmd;
     iton_bt_buffer[1] = b1;
     iton_bt_buffer[2] = b2;
+    memset(&iton_bt_buffer[3], 0, ITON_BT_BUFFER_LEN - 3);
 
-    spiStartSend(&ITON_BT_SPI_PORT, 3, &iton_bt_buffer[0]);
+    chSysLock();
+    spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+    iton_bt_tx_active = true;
+    spiStartExchangeI(&ITON_BT_SPI_PORT, 3, &iton_bt_buffer[0], &iton_bt_rx_buffer[0]);
+    gpio_write_pin_high(ITON_BT_IRQ_LINE);
+    chSysUnlock();
 }
 
 inline void iton_bt_send_ack(uint8_t b1, uint8_t b2) {
-    gpio_write_pin_high(ITON_BT_IRQ_LINE);
-    iton_bt_tx_active = true;
     iton_bt_buffer[0] = control;
     iton_bt_buffer[1] = b1;
     iton_bt_buffer[2] = b2;
     chSysLockFromISR();
+    spiStopTransferI(&ITON_BT_SPI_PORT, NULL);
+    iton_bt_tx_active = true;
     spiStartSendI(&ITON_BT_SPI_PORT, 3, &iton_bt_buffer[0]);
+    gpio_write_pin_high(ITON_BT_IRQ_LINE);
     chSysUnlockFromISR();
 }
 
